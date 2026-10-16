@@ -127,17 +127,71 @@ async function setLastBlock(key, block) {
 // ------------------------------------------------------------
 // Control de frecuencia del refresco de estados (solo marketplace)
 // ------------------------------------------------------------
-async function shouldRefreshStates() {
-  const { data, error } = await supabase
-    .from('indexer_state')
-    .select('updated_at')
-    .eq('key', 'state_refresh')
-    .maybeSingle();
+// ------------------------------------------------------------
+// Detección de órdenes expiradas que necesitan reconciliación
+// ------------------------------------------------------------
+// Consulta la DB buscando órdenes en state=1 cuyo expires_at ya pasó.
+// Si hay alguna, significa que el contrato las considera EXPIRED pero
+// la DB aún no se ha enterado (falta el evento OrderExpired on-chain o
+// el refresh periódico no ha corrido todavía).
+// Devuelve el array de order_ids a reconciliar (o [] si no hay ninguna).
+async function findStaleExpiredOrders() {
+  const now = Math.floor(Date.now() / 1000);
 
-  if (error || !data) return true;
-  const last = new Date(data.updated_at).getTime();
-  const elapsed = Date.now() - last;
-  return elapsed >= REFRESH_STATES_INTERVAL_HOURS * 60 * 60 * 1000;
+  const { data, error } = await supabase
+    .from('orders')
+    .select('order_id')
+    .eq('state', 1)
+    .eq('marketplace', 'new')
+    .gt('expires_at', 0)
+    .lt('expires_at', now)
+    .limit(200);   // límite por run para no pasarse de tiempo
+
+  if (error) {
+    console.warn('[Indexer] findStaleExpiredOrders fallo:', error.message);
+    return [];
+  }
+
+  return (data || []).map((r) => r.order_id);
+}
+
+// ------------------------------------------------------------
+// Refresh quirúrgico de órdenes concretas
+// ------------------------------------------------------------
+// Solo llama a orderState() para las órdenes que realmente lo necesitan.
+// Mucho más barato que recorrer TODAS las órdenes activas.
+async function refreshSpecificOrders(config, orderIds) {
+  if (!orderIds || orderIds.length === 0) return { checked: 0, updated: 0 };
+
+  console.log(`[marketplace] Reconciliando ${orderIds.length} órdenes expiradas…`);
+
+  const market = new ethers.Contract(
+    config.address,
+    ['function orderState(bytes32 orderId) view returns (uint8)'],
+    provider
+  );
+
+  let updated = 0;
+  const now = new Date().toISOString();
+
+  for (const orderId of orderIds) {
+    try {
+      const state = Number(await market.orderState(orderId));
+      if (state !== 1) {
+        const { error } = await supabase
+          .from('orders')
+          .update({ state, updated_at: now })
+          .eq('order_id', orderId);
+        if (!error) updated++;
+      }
+    } catch (e) {
+      console.warn(`[marketplace] orderState fallo ${orderId.slice(0, 10)}…:`, e.message);
+    }
+    await sleep(STATE_REFRESH_DELAY_MS);
+  }
+
+  console.log(`[marketplace] Reconciliación: ${updated}/${orderIds.length} actualizadas`);
+  return { checked: orderIds.length, updated };
 }
 
 async function markStatesRefreshed() {
@@ -519,26 +573,43 @@ async function refreshActiveOrdersState(config) {
     }
   }
 
-  // 2. Refrescar órdenes activas on-chain (cada X horas, solo marketplace)
-  try {
-    if (await shouldRefreshStates()) {
-      console.log('[Indexer] Iniciando refresco de estados on-chain…');
-      const marketCfg = CONTRACTS.marketplace_new;
-      if (marketCfg) {
-        try {
-          await refreshActiveOrdersState(marketCfg);
-        } catch (e) {
-          console.error('[marketplace] Fallo refrescando estados:', e.message);
-        }
-      }
-      await markStatesRefreshed();
-      console.log('[Indexer] Refresco de estados completado ✅');
+// 2. Reconciliación de órdenes expiradas (siempre, es barato)
+try {
+  const marketCfg = CONTRACTS.marketplace_new;
+  if (marketCfg) {
+    const staleOrders = await findStaleExpiredOrders();
+
+    if (staleOrders.length > 0) {
+      // Hay órdenes caducadas en la DB → reconciliar YA (quirúrgico)
+      await refreshSpecificOrders(marketCfg, staleOrders);
     } else {
-      console.log('[Indexer] Refresco de estados: aún no toca');
+      console.log('[Indexer] Sin órdenes expiradas pendientes de reconciliar');
     }
-  } catch (e) {
-    console.error('[Indexer] Error en refresco de estados:', e.message);
   }
+} catch (e) {
+  console.error('[Indexer] Error en reconciliación de expiradas:', e.message);
+}
+
+// 3. Refresh completo periódico (cada 3h, red de seguridad)
+//    Cubre casos raros: órdenes canceladas, invalidadas, o expiradas
+//    cuyo expires_at es 0/Null (sin caducidad) pero el contrato sí las cerró.
+try {
+  if (await shouldRefreshStates()) {
+    console.log('[Indexer] Full refresh periódico (cada 3h)…');
+    const marketCfg = CONTRACTS.marketplace_new;
+    if (marketCfg) {
+      try {
+        await refreshActiveOrdersState(marketCfg);
+      } catch (e) {
+        console.error('[marketplace] Fallo en full refresh:', e.message);
+      }
+    }
+    await markStatesRefreshed();
+    console.log('[Indexer] Full refresh completado ✅');
+  }
+} catch (e) {
+  console.error('[Indexer] Error en full refresh:', e.message);
+}
 
   const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
   console.log(`[Indexer] Fin en ${elapsed}s`);
