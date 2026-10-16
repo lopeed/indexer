@@ -1,8 +1,6 @@
 name: Marketplace & Vaults Indexer
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/10 * * * *'
 jobs:
   index:
     runs-on: ubuntu-latest
