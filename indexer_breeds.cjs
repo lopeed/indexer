@@ -30,7 +30,6 @@ const provider = new ethers.JsonRpcProvider(RPC_URL, 56, { staticNetwork: true }
 
 const BREEDING = '0x39be8c4fa342c5f3c10d7c16941a0946d29ade4a';
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
-const BREEDING_CONTRACT = '0x39be8c4fa342c5f3c10d7c16941a0946d29ade4a';
 
 const BREEDING_ABI = [
   'function getNumBreedsByCukie(uint256 _cukieId) view returns (uint256)',

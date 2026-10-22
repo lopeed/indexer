@@ -40,9 +40,16 @@ const NFT_ABI = [
   'function ownerOf(uint256 tokenId) view returns (address)',
 ];
 
+const BREEDING_CONTRACT = '0x39be8c4fa342c5f3c10d7c16941a0946d29ade4a';
+
+const BREEDING_ABI = [
+  'function getNumBreedsByCukie(uint256 _cukieId) view returns (uint256)',
+];
+
 const MULTICALL_ABI = [
   'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[])',
 ];
+
 
 // ------------------------------------------------------------
 // Chunks y rate limit
