@@ -108,6 +108,7 @@ async function fetchAllTokenIds(total) {
 // ------------------------------------------------------------
 async function fetchAllData(tokenIds) {
   const nft = new ethers.Contract(CUKIE_NFT_CONTRACT, NFT_ABI, provider);
+  const breedingInterface = new ethers.Interface(BREEDING_ABI);
   const multicall = new ethers.Contract(MULTICALL3, MULTICALL_ABI, provider);
 
   const rows = [];
@@ -116,32 +117,40 @@ async function fetchAllData(tokenIds) {
     const end = Math.min(start + DATA_PER_CHUNK, tokenIds.length);
     const batch = tokenIds.slice(start, end);
 
-    // Llamadas getCukie
+    // 1. Llamadas getCukie
     const dataCalls = batch.map((id) => ({
       target: CUKIE_NFT_CONTRACT,
       allowFailure: true,
       callData: nft.interface.encodeFunctionData('getCukie', [id]),
     }));
 
-    // Llamadas ownerOf (en paralelo)
+    // 2. Llamadas ownerOf
     const ownerCalls = batch.map((id) => ({
       target: CUKIE_NFT_CONTRACT,
       allowFailure: true,
       callData: nft.interface.encodeFunctionData('ownerOf', [id]),
     }));
 
-    const [dataResults, ownerResults] = await Promise.all([
+    // 3. Llamadas getNumBreedsByCukie (NUEVO)
+    const breedCalls = batch.map((id) => ({
+      target: BREEDING_CONTRACT,
+      allowFailure: true,
+      callData: breedingInterface.encodeFunctionData('getNumBreedsByCukie', [id]),
+    }));
+
+    // Ejecutamos las 3 en paralelo
+    const [dataResults, ownerResults, breedResults] = await Promise.all([
       multicall.aggregate3.staticCall(dataCalls),
       multicall.aggregate3.staticCall(ownerCalls),
+      multicall.aggregate3.staticCall(breedCalls),
     ]);
 
     for (let i = 0; i < batch.length; i++) {
       const id = batch[i];
       const dr = dataResults[i];
       const or = ownerResults[i];
+      const br = breedResults[i];
 
-      // Si getCukie falla, saltamos la fila para NO machacar
-      // datos buenos ya indexados con null/0 en el upsert.
       if (!dr.success) {
         console.warn(`[Cukies] getCukie fallo para ${id}, saltando`);
         continue;
@@ -161,6 +170,11 @@ async function fetchAllData(tokenIds) {
         owner = nft.interface.decodeFunctionResult('ownerOf', or.returnData)[0].toLowerCase();
       }
 
+      let breedsDone = 0;
+      if (br.success) {
+        breedsDone = Number(breedingInterface.decodeFunctionResult('getNumBreedsByCukie', br.returnData)[0]);
+      }
+
       rows.push({
         token_id: id,
         generation,
@@ -170,14 +184,11 @@ async function fetchAllData(tokenIds) {
         skill1: skills[0], skill2: skills[1], skill3: skills[2],
         skill4: skills[3], skill5: skills[4], skill6: skills[5],
         owner,
+        breeds_done: breedsDone, // <- NUEVO
         updated_at: new Date().toISOString(),
       });
     }
-
-    console.log(`[Cukies] ${rows.length}/${tokenIds.length} filas preparadas`);
-    if (end < tokenIds.length) await sleep(CHUNK_DELAY_MS);
   }
-
   return rows;
 }
 
