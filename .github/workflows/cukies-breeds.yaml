@@ -1,0 +1,21 @@
+name: Breeds Indexer (on-chain → Supabase)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */4 * * *'   # cada 4h (00:00, 04:00, 08:00, ...)
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run breeds indexer
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          BSCTRACE_API_KEY: ${{ secrets.BSCTRACE_API_KEY }}
+        run: node indexer_breeds.cjs
