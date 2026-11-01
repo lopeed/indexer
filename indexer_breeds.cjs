@@ -66,7 +66,6 @@ const TRON_KNOWN_LAST      = 4248;   // último breed_id confirmado (2023-04-10)
 const TRON_SAFETY_BUFFER   = 20;     // cola adicional a revisar
 const TRON_ZERO_ADDRESS    = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
 const TRONGRID_API_KEY     = '718a45cc-662e-459d-9a47-ecb0bc8d2d66';
-const TRON_CALLER_ADDRESS = 'TNHxJS1G7TSkEfDHizsjb9aiku5yjq95nP';
 
 const TRON_BREEDING_ABI = [{
   inputs:  [{ name: '_breed', type: 'uint256' }],
@@ -386,7 +385,7 @@ async function indexTronBreeds() {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
           // ── CLAVE: pasar `from` ─────────────────────────
-          const b = await contract.breeds(id).call({ from: TRON_CALLER_ADDRESS });
+          const b = await contract.breeds(id).call();
           return { id, data: b, error: null };
         } catch (e) {
           const is429 = String(e.message).includes('429') ||
