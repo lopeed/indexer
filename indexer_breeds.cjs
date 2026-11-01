@@ -2,12 +2,16 @@
 // ============================================================
 // Breeds Indexer
 //
-// 1) Por cada wallet en `user_wallets`, lee on-chain:
+// 1) BSC · por cada wallet en `user_wallets`, lee on-chain:
 //    getAllBreedsOwner → breeds(id) → upsert en `breedings`
 //
-// 2) Indexa TODOS los eventos BreedFinish del contrato y los
-//    deja en `all_breeds` (para poder resolver "padres" de
-//    cualquier bebé, propio o ajeno, desde el modal).
+// 2) BSC · indexa TODOS los eventos BreedFinish del contrato
+//    → upsert en `all_breeds` (chain='bsc')
+//
+// 3) TRON · iterar breeds(0..4248) una sola vez (backfill)
+//    → upsert en `all_breeds` (chain='tron')
+//    Después solo revisa la cola (últimos 20 slots) por si
+//    apareciera alguna nueva (improbable: TRON paró en 2023).
 //
 // Ejecución recomendada: cada 2-4h vía GitHub Actions.
 // ============================================================
@@ -35,7 +39,7 @@ const RPC_URL = `https://bsc-mainnet.nodereal.io/v1/${BSCTRACE_API_KEY}`;
 const provider = new ethers.JsonRpcProvider(RPC_URL, 56, { staticNetwork: true });
 
 // ------------------------------------------------------------
-// Constantes de contratos
+// Constantes BSC
 // ------------------------------------------------------------
 const BREEDING   = '0x39be8c4fa342c5f3c10d7c16941a0946d29ade4a';
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
@@ -55,16 +59,46 @@ const BREED_FINISH_ABI = [
 ];
 
 // ------------------------------------------------------------
-// Config
+// Constantes TRON
 // ------------------------------------------------------------
-const WALLETS_PER_CHUNK = 100;     // wallets por multicall
-const BREEDS_PER_CHUNK  = 150;     // breeds por multicall
+const TRON_BREEDING_BASE58 = 'TXrvQKgzWpsMkp9ebiF1uXNPRgKxNanB9S';
+const TRON_KNOWN_LAST      = 4248;   // último breed_id confirmado (2023-04-10)
+const TRON_SAFETY_BUFFER   = 20;     // cola adicional a revisar
+const TRON_ZERO_ADDRESS    = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
+const TRONGRID_API_KEY     = '718a45cc-662e-459d-9a47-ecb0bc8d2d66';
+
+const TRON_BREEDING_ABI = [{
+  inputs:  [{ name: '_breed', type: 'uint256' }],
+  name:    'breeds',
+  outputs: [
+    { name: 'parent1',   type: 'uint256' },
+    { name: 'parent2',   type: 'uint256' },
+    { name: 'start_at',  type: 'uint256' },
+    { name: 'finish_at', type: 'uint256' },
+    { name: 'owner',     type: 'address' },
+    { name: 'completed', type: 'bool'    },
+    { name: 'result',    type: 'uint256' },
+  ],
+  stateMutability: 'view',
+  type: 'function',
+}];
+
+// ------------------------------------------------------------
+// Config BSC
+// ------------------------------------------------------------
+const WALLETS_PER_CHUNK = 100;
+const BREEDS_PER_CHUNK  = 150;
 const CHUNK_DELAY_MS    = 250;
 
-// Bloques del evento BreedFinish
-const EVENT_CHUNK       = 25_000;  // 25k bloques por queryFilter (seguro en Nodereal)
-const EVENT_CHUNK_DELAY = 300;     // ms entre chunks
-const EVENT_FROM_BLOCK  = 17_000_000; // ≈ deploy CukieToken (mayo 2022). Ajusta si lo sabes exacto.
+const EVENT_CHUNK       = 25_000;
+const EVENT_CHUNK_DELAY = 300;
+const EVENT_FROM_BLOCK  = 17_000_000;
+
+// ------------------------------------------------------------
+// Config TRON
+// ------------------------------------------------------------
+const TRON_CONCURRENCY = 12;    // llamadas simultáneas a TronGrid
+const TRON_DELAY_MS    = 80;  // entre tandas (evita 429)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -133,7 +167,7 @@ async function fetchAllBreedIds(wallets, breeding, multicall) {
 }
 
 // ============================================================
-// 3) breeds(id) para todos los IDs (multicall)
+// 3) breeds(id) por cada ID (multicall)
 // ============================================================
 async function fetchBreedRows(ids, breeding, multicall) {
   const rows = [];
@@ -166,8 +200,6 @@ async function fetchBreedRows(ids, breeding, multicall) {
           finish_at: new Date(Number(d[3]) * 1000).toISOString(),
           status: completed ? 'bred' : 'started',
           bred_token_id: completed && result > 0n ? result.toString() : null,
-          // NO incluimos start_tx_hash / breed_tx_hash:
-          // el upsert los respeta si ya existen.
         });
       }
     } catch (e) {
@@ -181,7 +213,7 @@ async function fetchBreedRows(ids, breeding, multicall) {
 }
 
 // ============================================================
-// 4) Upsert en `breedings`
+// 4) Upsert en `breedings` (BSC)
 // ============================================================
 async function upsertBreedRows(rows) {
   const CHUNK = 500;
@@ -200,37 +232,30 @@ async function upsertBreedRows(rows) {
 }
 
 // ============================================================
-// 5) Indexar BreedFinish → all_breeds
+// 5) BSC · BreedFinish → all_breeds
 // ============================================================
-// Persistimos `last_block` dentro del loop para que, si el
-// Action se corta por timeout, la próxima ejecución retome
-// desde el último chunk procesado en vez de desde el deploy.
-// ============================================================
-async function indexAllBreedFinish(provider) {
+async function indexBscBreedFinish() {
   const stateKey = 'breed_finish';
 
-  // Leer el último bloque ya indexado
   const { data: stateRow, error: stateErr } = await supabase
     .from('indexer_state')
     .select('last_block')
     .eq('key', stateKey)
     .maybeSingle();
 
-  if (stateErr) {
-    console.warn('[Breeds] indexer_state SELECT falló:', stateErr.message);
-  }
+  if (stateErr) console.warn('[Breeds] indexer_state SELECT falló:', stateErr.message);
 
   const savedLast = stateRow?.last_block ? Number(stateRow.last_block) : 0;
   let fromBlock = savedLast > 0 ? savedLast + 1 : EVENT_FROM_BLOCK;
 
   const head = await provider.getBlockNumber();
   if (fromBlock > head) {
-    console.log(`[Breeds] all_breeds ya al día (${fromBlock} > ${head})`);
+    console.log(`[Breeds] BSC all_breeds ya al día (${fromBlock} > ${head})`);
     return;
   }
 
   console.log(
-    `[Breeds] all_breeds: indexando de ${fromBlock} a ${head} ` +
+    `[Breeds] BSC all_breeds: ${fromBlock} → ${head} ` +
     `(${head - fromBlock + 1} bloques · chunks de ${EVENT_CHUNK})`
   );
 
@@ -246,8 +271,6 @@ async function indexAllBreedFinish(provider) {
       evs = await contract.queryFilter('BreedFinish', fromBlock, toBlock);
     } catch (e) {
       console.warn(`[Breeds] queryFilter ${fromBlock}→${toBlock} falló:`, e.message);
-      // No abortamos: avanzamos igualmente para no bloquear el resto.
-      // Si esto se repite mucho, baja EVENT_CHUNK o sube EVENT_CHUNK_DELAY.
       fromBlock = toBlock + 1;
       await sleep(EVENT_CHUNK_DELAY);
       continue;
@@ -262,6 +285,7 @@ async function indexAllBreedFinish(provider) {
           parent2_id:      String(ev.args.parent2),
           owner:           ev.args.user.toLowerCase(),
           bred_at:         new Date(Number(ev.args.date) * 1000).toISOString(),
+          chain:           'bsc',
         }));
 
       if (rows.length > 0) {
@@ -271,12 +295,9 @@ async function indexAllBreedFinish(provider) {
 
         if (error) {
           console.error(
-            `[Breeds] upsert all_breeds ${fromBlock}→${toBlock} falló:`,
+            `[Breeds] upsert all_breeds (BSC) ${fromBlock}→${toBlock} falló:`,
             error.message
           );
-          // No abortamos: seguimos avanzando, se reintentará en la próxima ejecución
-          // (aunque el last_block ya habrá avanzado, así que quizá haya que
-          // hacer un backfill manual si esto es crítico).
         } else {
           totalInserted += rows.length;
         }
@@ -285,24 +306,153 @@ async function indexAllBreedFinish(provider) {
 
     chunkCount++;
     console.log(
-      `[Breeds] all_breeds ${fromBlock}→${toBlock}: ` +
+      `[Breeds] BSC all_breeds ${fromBlock}→${toBlock}: ` +
       `${evs.length} finishes · total ${totalInserted} · chunk ${chunkCount}`
     );
 
-    // Persistir el progreso por chunk
-    await supabase
-      .from('indexer_state')
-      .upsert({
-        key: stateKey,
-        last_block: toBlock,
-        updated_at: new Date().toISOString(),
-      });
+    await supabase.from('indexer_state').upsert({
+      key: stateKey,
+      last_block: toBlock,
+      updated_at: new Date().toISOString(),
+    });
 
     fromBlock = toBlock + 1;
     if (fromBlock <= head) await sleep(EVENT_CHUNK_DELAY);
   }
 
-  console.log(`[Breeds] ✅ all_breeds sincronizada · ${totalInserted} finishes nuevos`);
+  console.log(`[Breeds] ✅ BSC all_breeds · ${totalInserted} finishes nuevos`);
+}
+
+// ============================================================
+// 6) TRON · breeds(0..N) → all_breeds
+// ============================================================
+async function indexTronBreeds() {
+  // Carga diferida de tronweb para no romper si no está instalado
+  let TronWeb;
+  try {
+    ({ TronWeb } = require('tronweb'));
+  } catch {
+    console.warn(
+      '[Breeds] TRON: `tronweb` no instalado — skipping. ' +
+      'Ejecuta `npm install tronweb` para habilitar la fase TRON.'
+    );
+    return;
+  }
+
+  // ¿Ya hicimos el backfill completo?
+  const { data: stateRow } = await supabase
+    .from('indexer_state')
+    .select('last_block')
+    .eq('key', 'tron_breed_backfill_done')
+    .maybeSingle();
+
+  const alreadyDone = !!stateRow?.last_block;
+
+  const startId = alreadyDone ? TRON_KNOWN_LAST + 1 : 0;
+  const maxId   = TRON_KNOWN_LAST + TRON_SAFETY_BUFFER;
+
+  if (startId > maxId) {
+    console.log('[Breeds] TRON: nada que revisar');
+    return;
+  }
+
+  console.log(
+    `[Breeds] TRON: ${alreadyDone ? 'tail check' : 'backfill completo'} ` +
+    `${startId} → ${maxId} (${maxId - startId + 1} breeds)`
+  );
+
+  const TRONGRID_API_KEY = '718a45cc-662e-459d-9a47-ecb0bc8d2d66';
+
+  const tronWeb = new TronWeb({
+    fullHost: 'https://api.trongrid.io',
+    headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
+  });
+
+  const contract = await tronWeb.contract(TRON_BREEDING_ABI, TRON_BREEDING_BASE58);
+
+  const rows = [];
+  let processed = 0;
+  let valid = 0;
+
+  for (let batchStart = startId; batchStart <= maxId; batchStart += TRON_CONCURRENCY) {
+    const ids = [];
+    for (let k = 0; k < TRON_CONCURRENCY && batchStart + k <= maxId; k++) {
+      ids.push(batchStart + k);
+    }
+
+    const results = await Promise.all(ids.map(async (id) => {
+      try {
+        const b = await contract.breeds(id).call();
+        return { id, data: b, error: null };
+      } catch (e) {
+        return { id, data: null, error: e.message };
+      }
+    }));
+
+    for (const { id, data, error } of results) {
+      processed++;
+      if (error) {
+        console.warn(`[Breeds] TRON breeds(${id}) error:`, error);
+        continue;
+      }
+
+      const owner = String(data.owner || '');
+      if (!owner || owner === TRON_ZERO_ADDRESS) continue;
+
+      const resultStr = String(data.result ?? '0');
+      if (resultStr === '0') continue; // slot sin mint
+
+      const finishAt = Number(String(data.finish_at ?? '0'));
+      const startAt  = Number(String(data.start_at  ?? '0'));
+
+      rows.push({
+        breed_result_id: resultStr,
+        parent1_id:      String(data.parent1),
+        parent2_id:      String(data.parent2),
+        owner:           owner,  // base58 T…
+        bred_at:         new Date((finishAt || startAt) * 1000).toISOString(),
+        chain:           'tron',
+      });
+      valid++;
+    }
+
+    if (processed % 200 < TRON_CONCURRENCY) {
+      console.log(
+        `[Breeds] TRON: ${processed}/${maxId - startId + 1} procesados · ${valid} válidos`
+      );
+    }
+
+    await sleep(TRON_DELAY_MS);
+  }
+
+  // Upsert
+  if (rows.length > 0) {
+    const CHUNK = 500;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      const { error } = await supabase
+        .from('all_breeds')
+        .upsert(chunk, { onConflict: 'breed_result_id' });
+
+      if (error) {
+        console.error(`[Breeds] TRON upsert falló (${i}):`, error.message);
+        throw error;
+      }
+      console.log(`[Breeds] TRON upsert OK ${i + chunk.length}/${rows.length}`);
+    }
+  }
+
+  console.log(`[Breeds] ✅ TRON all_breeds · ${valid} breeds válidos`);
+
+  // Marcar backfill como completado (solo la 1ª vez)
+  if (!alreadyDone) {
+    await supabase.from('indexer_state').upsert({
+      key: 'tron_breed_backfill_done',
+      last_block: 1,
+      updated_at: new Date().toISOString(),
+    });
+    console.log('[Breeds] TRON: backfill marcado como completado');
+  }
 }
 
 // ============================================================
@@ -313,7 +463,7 @@ async function indexAllBreedFinish(provider) {
   console.log(`[Breeds] Inicio ${new Date().toISOString()}`);
 
   try {
-    // ── FASE 1: breeds de las wallets conocidas ─────────────
+    // ── FASE 1: breeds de wallets conocidas (BSC) ───────────
     const wallets = await loadAllWallets();
     console.log(`[Breeds] Wallets a procesar: ${wallets.length}`);
 
@@ -335,8 +485,19 @@ async function indexAllBreedFinish(provider) {
       console.log('[Breeds] Sin wallets en user_wallets — saltando fase 1');
     }
 
-    // ── FASE 2: TODOS los BreedFinish → all_breeds ──────────
-    await indexAllBreedFinish(provider);
+    // ── FASE 2: BSC BreedFinish → all_breeds ────────────────
+    try {
+      await indexBscBreedFinish();
+    } catch (e) {
+      console.error('[Breeds] Fase BSC falló:', e.message);
+    }
+
+    // ── FASE 3: TRON breeds(0..N) → all_breeds ──────────────
+    try {
+      await indexTronBreeds();
+    } catch (e) {
+      console.error('[Breeds] Fase TRON falló:', e.message);
+    }
 
     const elapsed = ((Date.now() - started) / 1000).toFixed(1);
     console.log(`[Breeds] ✅ Fin en ${elapsed}s`);
