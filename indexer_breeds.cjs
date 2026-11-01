@@ -66,6 +66,7 @@ const TRON_KNOWN_LAST      = 4248;   // último breed_id confirmado (2023-04-10)
 const TRON_SAFETY_BUFFER   = 20;     // cola adicional a revisar
 const TRON_ZERO_ADDRESS    = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
 const TRONGRID_API_KEY     = '718a45cc-662e-459d-9a47-ecb0bc8d2d66';
+const TRON_CALLER_ADDRESS = 'TNHxJS1G7TSkEfDHizsjb9aiku5yjq95nP';
 
 const TRON_BREEDING_ABI = [{
   inputs:  [{ name: '_breed', type: 'uint256' }],
@@ -97,8 +98,8 @@ const EVENT_FROM_BLOCK  = 17_000_000;
 // ------------------------------------------------------------
 // Config TRON
 // ------------------------------------------------------------
-const TRON_CONCURRENCY = 12;    // llamadas simultáneas a TronGrid
-const TRON_DELAY_MS    = 80;  // entre tandas (evita 429)
+const TRON_CONCURRENCY = 4;    // llamadas simultáneas a TronGrid
+const TRON_DELAY_MS    = 300;  // entre tandas (evita 429)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -361,8 +362,6 @@ async function indexTronBreeds() {
     `${startId} → ${maxId} (${maxId - startId + 1} breeds)`
   );
 
-  const TRONGRID_API_KEY = '718a45cc-662e-459d-9a47-ecb0bc8d2d66';
-
   const tronWeb = new TronWeb({
     fullHost: 'https://api.trongrid.io',
     headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
@@ -382,7 +381,7 @@ async function indexTronBreeds() {
 
     const results = await Promise.all(ids.map(async (id) => {
       try {
-        const b = await contract.breeds(id).call();
+        const b = await contract.breeds(id).call({ from: TRON_CALLER_ADDRESS });
         return { id, data: b, error: null };
       } catch (e) {
         return { id, data: null, error: e.message };
