@@ -63,9 +63,10 @@ const BREED_FINISH_ABI = [
 // ------------------------------------------------------------
 const TRON_BREEDING_BASE58 = 'TXrvQKgzWpsMkp9ebiF1uXNPRgKxNanB9S';
 const TRON_KNOWN_LAST      = 4248;   // último breed_id confirmado (2023-04-10)
-const TRON_SAFETY_BUFFER   = 20;     // cola adicional a revisar
+const TRON_SAFETY_BUFFER   = 5;     // cola adicional a revisar
 const TRON_ZERO_ADDRESS    = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
 const TRONGRID_API_KEY     = '718a45cc-662e-459d-9a47-ecb0bc8d2d66';
+const TRON_CALLER_ADDRESS = 'TNHxJS1G7TSkEfDHizsjb9aiku5yjq95nP';
 
 const TRON_BREEDING_ABI = [{
   inputs:  [{ name: '_breed', type: 'uint256' }],
@@ -326,9 +327,6 @@ async function indexBscBreedFinish() {
 // ============================================================
 // 6) TRON · breeds(0..N) → all_breeds
 // ============================================================
-// ============================================================
-// 6) TRON · breeds(0..N) → all_breeds
-// ============================================================
 async function indexTronBreeds() {
   let TronWeb;
   try {
@@ -338,7 +336,6 @@ async function indexTronBreeds() {
     return;
   }
 
-  // ¿Ya hicimos el backfill?
   const { data: stateRow } = await supabase
     .from('indexer_state')
     .select('last_block')
@@ -347,7 +344,7 @@ async function indexTronBreeds() {
 
   const alreadyDone = !!stateRow?.last_block;
   const startId = alreadyDone ? TRON_KNOWN_LAST + 1 : 0;
-  const maxId   = TRON_KNOWN_LAST + TRON_SAFETY_BUFFER;
+  const maxId   = TRON_KNOWN_LAST + TRON_SAFETY_BUFFER;  // 4248 + 5 = 4253
 
   if (startId > maxId) {
     console.log('[Breeds] TRON: nada que revisar');
@@ -366,13 +363,23 @@ async function indexTronBreeds() {
 
   const contract = await tronWeb.contract(TRON_BREEDING_ABI, TRON_BREEDING_BASE58);
 
+  // Errores que significan "slot vacío" (breed_id fuera de rango)
+  const isExpectedEmptyError = (msg) => {
+    const m = String(msg || '');
+    return m.includes('opCode[fe]')
+        || m.includes('IllegalOperationException')
+        || m.includes('OUT_OF_BOUNDS')
+        || m.includes('REVERT')
+        || m.includes('revert');
+  };
+
   const rows = [];
   let processed = 0;
   let valid = 0;
+  let unexpectedErrors = 0;
 
-  // ── CONCURRENCIA REAL y BACKOFF ─────────────────────────
-  const CONCURRENCY = 4;        // no 12
-  const BATCH_DELAY = 300;      // ms entre lotes (~10-12 req/s)
+  const CONCURRENCY = 4;
+  const BATCH_DELAY = 300;
   const MAX_RETRIES = 3;
 
   for (let batchStart = startId; batchStart <= maxId; batchStart += CONCURRENCY) {
@@ -384,19 +391,19 @@ async function indexTronBreeds() {
     const results = await Promise.all(ids.map(async (id) => {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          // ── CLAVE: pasar `from` ─────────────────────────
-          const b = await contract.breeds(id).call();
+          const b = await contract.breeds(id).call({ from: TRON_CALLER_ADDRESS });
           return { id, data: b, error: null };
         } catch (e) {
-          const is429 = String(e.message).includes('429') ||
-                        String(e.message).includes('Too Many');
+          const msg = String(e.message || '');
+          const is429 = msg.includes('429') || msg.includes('Too Many');
+
           if (is429 && attempt < MAX_RETRIES - 1) {
             const backoff = 1500 * (attempt + 1);
             console.warn(`[Breeds] TRON breeds(${id}) 429 — retry ${attempt + 1} en ${backoff}ms`);
             await sleep(backoff);
             continue;
           }
-          return { id, data: null, error: e.message };
+          return { id, data: null, error: msg };
         }
       }
       return { id, data: null, error: 'max_retries' };
@@ -405,7 +412,12 @@ async function indexTronBreeds() {
     for (const { id, data, error } of results) {
       processed++;
       if (error) {
-        console.warn(`[Breeds] TRON breeds(${id}) error:`, error);
+        if (isExpectedEmptyError(error)) {
+          // Slot vacío → normal, no es error
+          continue;
+        }
+        console.warn(`[Breeds] TRON breeds(${id}) error inesperado:`, error);
+        unexpectedErrors++;
         continue;
       }
 
@@ -431,7 +443,7 @@ async function indexTronBreeds() {
 
     if (processed % 100 < CONCURRENCY) {
       console.log(
-        `[Breeds] TRON: ${processed}/${maxId - startId + 1} · ${valid} válidos`
+        `[Breeds] TRON: ${processed}/${maxId - startId + 1} · ${valid} válidos · ${unexpectedErrors} errores`
       );
     }
 
@@ -446,6 +458,7 @@ async function indexTronBreeds() {
       const { error } = await supabase
         .from('all_breeds')
         .upsert(chunk, { onConflict: 'breed_result_id' });
+
       if (error) {
         console.error(`[Breeds] TRON upsert falló (${i}):`, error.message);
         throw error;
@@ -456,15 +469,24 @@ async function indexTronBreeds() {
 
   console.log(`[Breeds] ✅ TRON all_breeds · ${valid} breeds válidos`);
 
+  // Solo marcar como done si realmente se guardó algo y NO hubo errores
   if (!alreadyDone) {
-    await supabase.from('indexer_state').upsert({
-      key: 'tron_breed_backfill_done',
-      last_block: 1,
-      updated_at: new Date().toISOString(),
-    });
-    console.log('[Breeds] TRON: backfill marcado como completado');
+    if (valid === 0 || unexpectedErrors > 0) {
+      console.warn(
+        `[Breeds] TRON: backfill NO marcado como done ` +
+        `(valid=${valid}, errores=${unexpectedErrors}) — se reintentará la próxima`
+      );
+    } else {
+      await supabase.from('indexer_state').upsert({
+        key: 'tron_breed_backfill_done',
+        last_block: 1,
+        updated_at: new Date().toISOString(),
+      });
+      console.log(`[Breeds] TRON: backfill marcado como completado (${valid} breeds)`);
+    }
   }
 }
+
 // ============================================================
 // Main
 // ============================================================
