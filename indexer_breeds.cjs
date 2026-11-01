@@ -327,20 +327,19 @@ async function indexBscBreedFinish() {
 // ============================================================
 // 6) TRON · breeds(0..N) → all_breeds
 // ============================================================
+// ============================================================
+// 6) TRON · breeds(0..N) → all_breeds
+// ============================================================
 async function indexTronBreeds() {
-  // Carga diferida de tronweb para no romper si no está instalado
   let TronWeb;
   try {
     ({ TronWeb } = require('tronweb'));
   } catch {
-    console.warn(
-      '[Breeds] TRON: `tronweb` no instalado — skipping. ' +
-      'Ejecuta `npm install tronweb` para habilitar la fase TRON.'
-    );
+    console.warn('[Breeds] TRON: `tronweb` no instalado — skipping.');
     return;
   }
 
-  // ¿Ya hicimos el backfill completo?
+  // ¿Ya hicimos el backfill?
   const { data: stateRow } = await supabase
     .from('indexer_state')
     .select('last_block')
@@ -348,7 +347,6 @@ async function indexTronBreeds() {
     .maybeSingle();
 
   const alreadyDone = !!stateRow?.last_block;
-
   const startId = alreadyDone ? TRON_KNOWN_LAST + 1 : 0;
   const maxId   = TRON_KNOWN_LAST + TRON_SAFETY_BUFFER;
 
@@ -358,7 +356,7 @@ async function indexTronBreeds() {
   }
 
   console.log(
-    `[Breeds] TRON: ${alreadyDone ? 'tail check' : 'backfill completo'} ` +
+    `[Breeds] TRON: ${alreadyDone ? 'tail check' : 'backfill'} ` +
     `${startId} → ${maxId} (${maxId - startId + 1} breeds)`
   );
 
@@ -373,19 +371,36 @@ async function indexTronBreeds() {
   let processed = 0;
   let valid = 0;
 
-  for (let batchStart = startId; batchStart <= maxId; batchStart += TRON_CONCURRENCY) {
+  // ── CONCURRENCIA REAL y BACKOFF ─────────────────────────
+  const CONCURRENCY = 4;        // no 12
+  const BATCH_DELAY = 300;      // ms entre lotes (~10-12 req/s)
+  const MAX_RETRIES = 3;
+
+  for (let batchStart = startId; batchStart <= maxId; batchStart += CONCURRENCY) {
     const ids = [];
-    for (let k = 0; k < TRON_CONCURRENCY && batchStart + k <= maxId; k++) {
+    for (let k = 0; k < CONCURRENCY && batchStart + k <= maxId; k++) {
       ids.push(batchStart + k);
     }
 
     const results = await Promise.all(ids.map(async (id) => {
-      try {
-        const b = await contract.breeds(id).call({ from: TRON_CALLER_ADDRESS });
-        return { id, data: b, error: null };
-      } catch (e) {
-        return { id, data: null, error: e.message };
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          // ── CLAVE: pasar `from` ─────────────────────────
+          const b = await contract.breeds(id).call({ from: TRON_CALLER_ADDRESS });
+          return { id, data: b, error: null };
+        } catch (e) {
+          const is429 = String(e.message).includes('429') ||
+                        String(e.message).includes('Too Many');
+          if (is429 && attempt < MAX_RETRIES - 1) {
+            const backoff = 1500 * (attempt + 1);
+            console.warn(`[Breeds] TRON breeds(${id}) 429 — retry ${attempt + 1} en ${backoff}ms`);
+            await sleep(backoff);
+            continue;
+          }
+          return { id, data: null, error: e.message };
+        }
       }
+      return { id, data: null, error: 'max_retries' };
     }));
 
     for (const { id, data, error } of results) {
@@ -399,7 +414,7 @@ async function indexTronBreeds() {
       if (!owner || owner === TRON_ZERO_ADDRESS) continue;
 
       const resultStr = String(data.result ?? '0');
-      if (resultStr === '0') continue; // slot sin mint
+      if (resultStr === '0') continue;
 
       const finishAt = Number(String(data.finish_at ?? '0'));
       const startAt  = Number(String(data.start_at  ?? '0'));
@@ -408,20 +423,20 @@ async function indexTronBreeds() {
         breed_result_id: resultStr,
         parent1_id:      String(data.parent1),
         parent2_id:      String(data.parent2),
-        owner:           owner,  // base58 T…
+        owner,
         bred_at:         new Date((finishAt || startAt) * 1000).toISOString(),
         chain:           'tron',
       });
       valid++;
     }
 
-    if (processed % 200 < TRON_CONCURRENCY) {
+    if (processed % 100 < CONCURRENCY) {
       console.log(
-        `[Breeds] TRON: ${processed}/${maxId - startId + 1} procesados · ${valid} válidos`
+        `[Breeds] TRON: ${processed}/${maxId - startId + 1} · ${valid} válidos`
       );
     }
 
-    await sleep(TRON_DELAY_MS);
+    await sleep(BATCH_DELAY);
   }
 
   // Upsert
@@ -432,7 +447,6 @@ async function indexTronBreeds() {
       const { error } = await supabase
         .from('all_breeds')
         .upsert(chunk, { onConflict: 'breed_result_id' });
-
       if (error) {
         console.error(`[Breeds] TRON upsert falló (${i}):`, error.message);
         throw error;
@@ -443,7 +457,6 @@ async function indexTronBreeds() {
 
   console.log(`[Breeds] ✅ TRON all_breeds · ${valid} breeds válidos`);
 
-  // Marcar backfill como completado (solo la 1ª vez)
   if (!alreadyDone) {
     await supabase.from('indexer_state').upsert({
       key: 'tron_breed_backfill_done',
@@ -453,7 +466,6 @@ async function indexTronBreeds() {
     console.log('[Breeds] TRON: backfill marcado como completado');
   }
 }
-
 // ============================================================
 // Main
 // ============================================================
